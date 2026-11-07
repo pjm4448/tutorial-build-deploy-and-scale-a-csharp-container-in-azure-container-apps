@@ -878,7 +878,35 @@ The tag `v1` is readable but mutable. The manifest digest identifies specific im
 
 **Purpose:** Reveal what the supplied Python script combines into one cloud-build command.
 
-Run:
+Restore the saved names, verify the operational `v1` image, and protect the mutable comparison tag from accidental replacement:
+
+```powershell
+. ./.env.ps1
+
+$ActualSubscription = az account show --query id --output tsv
+if ($ActualSubscription -ne $SubscriptionId) {
+    throw 'The active Azure subscription does not match the saved lab subscription.'
+}
+
+$DigestV1 = az acr repository show --subscription $SubscriptionId `
+    --name $AcrName `
+    --image "${ImageRepository}:v1" `
+    --query digest `
+    --output tsv
+if ($DigestV1 -notmatch '^sha256:[0-9a-f]{64}$') {
+    throw 'The operational v1 image is unavailable.'
+}
+
+$ExistingTags = @(az acr repository show-tags --subscription $SubscriptionId `
+    --name $AcrName `
+    --repository $ImageRepository `
+    --output json | ConvertFrom-Json)
+if ($ExistingTags -contains 'cloud-v1') {
+    throw 'Remote tag cloud-v1 already exists. Inspect its digest before deciding whether to replace it.'
+}
+```
+
+Run the cloud build from the repository root:
 
 ```powershell
 az acr build --subscription $SubscriptionId `
@@ -887,10 +915,49 @@ az acr build --subscription $SubscriptionId `
     --registry $AcrName `
     --image "${ImageRepository}:cloud-v1" `
     --file ./src/Agent.Api/Dockerfile `
+    --timeout 1800 `
     .
 ```
 
-Do not use `--no-logs`; inspect the cloud build output.
+Do not use `--no-logs`; inspect the source-context upload, restore, publish, and image-push output. The timeout limits the one-off build to 30 minutes.
+
+Verify the latest run and capture the cloud-built digest:
+
+```powershell
+$LatestRun = az acr task list-runs --subscription $SubscriptionId `
+    --resource-group $ResourceGroup `
+    --registry $AcrName `
+    --top 1 `
+    --output json | ConvertFrom-Json
+
+$LatestRun | Select-Object runId, status, startTime, finishTime, platform
+if ($LatestRun.status -ne 'Succeeded' -or
+    $LatestRun.platform.os -ne 'linux' -or
+    $LatestRun.platform.architecture -ne 'amd64') {
+    throw 'The latest ACR build run did not succeed on Linux AMD64.'
+}
+
+$DigestCloudV1 = az acr repository show --subscription $SubscriptionId `
+    --name $AcrName `
+    --image "${ImageRepository}:cloud-v1" `
+    --query digest `
+    --output tsv
+if ($DigestCloudV1 -notmatch '^sha256:[0-9a-f]{64}$') {
+    throw 'The cloud-v1 manifest digest is unavailable.'
+}
+
+az acr repository show-tags --subscription $SubscriptionId `
+    --name $AcrName `
+    --repository $ImageRepository `
+    --detail `
+    --output table
+
+[pscustomobject]@{
+    LocalWorkflowDigest = $DigestV1
+    CloudWorkflowDigest = $DigestCloudV1
+    DigestsEqual = $DigestV1 -eq $DigestCloudV1
+}
+```
 
 Compare the workflows:
 
@@ -904,11 +971,15 @@ Compare the workflows:
 
 The Dockerfile is the same in both cases. The builder location changes.
 
-> Some subscription offers or policies restrict ACR Tasks. If `az acr build` is unavailable, continue with the already-pushed `v1` image. The rest of the tutorial does not require cloud build.
+The two digests may be equal, but equality is not required. Different builder versions, build metadata or cache, and floating .NET base-image resolution can produce different image manifests from the same source and Dockerfile. For this comparison, validate the uploaded context, Dockerfile, Linux AMD64 platform, successful task run, tag, and digest rather than treating digest equality as a reproducibility guarantee.
+
+> Some subscription offers, policies, quotas, or role assignments restrict ACR Tasks. If `az acr build` is unavailable, record the exact error and confirm that `az acr repository show --name $AcrName --image "${ImageRepository}:v1" --query digest --output tsv --subscription $SubscriptionId` still succeeds. Continue with the already-pushed `v1` image; do not enable admin credentials, upgrade the registry, or broaden RBAC solely for this optional comparison. The rest of the tutorial does not require cloud build.
 
 ### Acceptance criteria
 
-- [ ] `cloud-v1` appears in ACR, or an ACR Tasks restriction is documented and `v1` remains available.
+- [ ] The latest one-off ACR run reports `Succeeded` on Linux AMD64, or an ACR Tasks restriction is documented and `v1` remains available.
+- [ ] `cloud-v1` appears in ACR with a valid `$DigestCloudV1`.
+- [ ] The local and cloud workflow digests are recorded and any difference is explained without treating it as a failure.
 - [ ] You can explain that `az acr build` uploads the build context, runs the Dockerfile remotely, and stores the result in ACR.
 - [ ] You can distinguish build context, Dockerfile, image, tag, repository, and registry.
 
