@@ -353,13 +353,14 @@ Important output includes:
 - `Agent.Api.dll`: compiled application assembly.
 - `Agent.Api.deps.json`: dependency graph.
 - `Agent.Api.runtimeconfig.json`: runtime configuration.
-- Supporting assemblies and configuration.
+- Dependency assemblies, when required, and application configuration files.
 
 ### 4.2 Run the published application
 
 ```powershell
 $env:ASPNETCORE_URLS = "http://localhost:8080"
 $env:APP_VERSION = "v1"
+$env:AGENT_DEFAULT_DELAY_MS = "500"
 dotnet ./artifacts/publish/Agent.Api.dll
 ```
 
@@ -369,15 +370,15 @@ In another terminal:
 Invoke-RestMethod http://localhost:8080/api/info
 ```
 
-Stop the application with **Ctrl+C**.
+Confirm that the response reports version `v1` and `defaultDelayMs` as `500`, then stop the application with **Ctrl+C**.
 
-> This is a framework-dependent publish. The output does not include the entire .NET runtime. The runtime will be supplied later by the ASP.NET Core runtime base image.
+> This is a framework-dependent publish. The output does not include the entire .NET runtime, so running the DLL locally requires a compatible .NET 10 ASP.NET Core runtime. The runtime will be supplied later by the ASP.NET Core runtime base image.
 
 ### Acceptance criteria
 
 - [ ] `artifacts/publish` contains `Agent.Api.dll`, `.deps.json`, and `.runtimeconfig.json`.
 - [ ] `dotnet ./artifacts/publish/Agent.Api.dll` starts the API successfully.
-- [ ] The published API returns HTTP 200 from `/api/info`.
+- [ ] The published API returns HTTP 200 from `/api/info` with version `v1` and default delay `500`.
 - [ ] You can explain that `dotnet publish` creates deployable application files but does not create a container image.
 
 ---
