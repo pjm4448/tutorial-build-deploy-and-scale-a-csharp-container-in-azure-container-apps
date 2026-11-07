@@ -1,0 +1,11 @@
+.git
+.gitignore
+.vs
+.vscode
+**/bin
+**/obj
+artifacts
+.env
+.env.ps1
+.lab-settings.json
+README.md
