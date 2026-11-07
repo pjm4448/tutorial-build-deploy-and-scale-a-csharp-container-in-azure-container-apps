@@ -157,11 +157,18 @@ All three commands should eventually return `Registered`.
 
 ### 2.1 Create the folders and solution
 
+When starting from a parent directory, create and initialize a new repository:
+
 ```powershell
 mkdir aca-scale-csharp
 Set-Location aca-scale-csharp
 
 git init
+```
+
+If the current directory is already the Git repository you intend to use, skip the preceding commands. From the repository root, run:
+
+```powershell
 dotnet new sln --name AcaScale --format sln
 mkdir src, scripts, artifacts
 
@@ -179,9 +186,13 @@ if ($SdkVersion -notmatch '^10\.0\.\d+$') {
     throw 'Select a stable .NET 10 SDK before creating global.json. Check dotnet --list-sdks.'
 }
 dotnet new globaljson --sdk-version $SdkVersion --roll-forward latestFeature
+
+$GlobalJson = Get-Content ./global.json -Raw | ConvertFrom-Json
+$GlobalJson.sdk | Add-Member -NotePropertyName allowPrerelease -NotePropertyValue $false -Force
+$GlobalJson | ConvertTo-Json -Depth 10 | Set-Content ./global.json -Encoding utf8
 ```
 
-This selects .NET 10 while allowing later .NET 10 feature bands and patches. In `global.json`, also add `"allowPrerelease": false` inside `sdk`. The Dockerfile copies this file before restore, so both builds use the same major/minor and roll-forward policy. The floating SDK image can still have a different compatible servicing version; this is not an exact SDK pin.
+This selects .NET 10 while allowing later .NET 10 feature bands and patches. It also excludes prerelease SDKs. The Dockerfile copies this file before restore, so both builds use the same major/minor and roll-forward policy. The floating SDK image can still have a different compatible servicing version; this is not an exact SDK pin.
 
 ### 2.3 Create `.gitignore`
 
@@ -200,6 +211,8 @@ artifacts/
 *.suo
 ```
 
+If the repository already has a comprehensive `.gitignore`, preserve it and add only any missing patterns from this list. Git does not retain empty directories; `scripts` and `artifacts` will appear in version control after later steps add files to them.
+
 ### 2.4 Build the generated project
 
 ```powershell
@@ -211,6 +224,7 @@ dotnet build --configuration Release --no-restore
 
 - [ ] `AcaScale.sln` contains `src/Agent.Api/Agent.Api.csproj`.
 - [ ] The project targets `net10.0`.
+- [ ] `global.json` selects a stable .NET 10 SDK, uses `latestFeature`, and disables prerelease SDKs.
 - [ ] `dotnet build --configuration Release` completes with no errors.
 - [ ] Build output and generated environment files are excluded from Git.
 
