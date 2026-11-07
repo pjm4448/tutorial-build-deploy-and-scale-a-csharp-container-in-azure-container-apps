@@ -473,6 +473,15 @@ ENTRYPOINT ["dotnet", "Agent.Api.dll"]
 From the repository root:
 
 ```powershell
+$ExistingContainer = docker ps --all --filter "name=^/agent-api$" --format '{{.Names}}'
+if ($ExistingContainer) {
+    throw "A container named 'agent-api' already exists. Inspect it before deciding whether to remove it."
+}
+
+if (Get-NetTCPConnection -LocalPort 8080 -State Listen -ErrorAction SilentlyContinue) {
+    throw 'Host port 8080 is already in use.'
+}
+
 docker build `
     --platform linux/amd64 `
     --progress=plain `
@@ -497,10 +506,12 @@ During the build, observe:
 ```powershell
 docker image ls agent-api
 docker image inspect agent-api:v1
+docker image inspect agent-api:v1 `
+    --format 'OS={{.Os}} Architecture={{.Architecture}} User={{.Config.User}} Ports={{json .Config.ExposedPorts}} Entrypoint={{json .Config.Entrypoint}}'
 docker history agent-api:v1
 ```
 
-Record the image ID and size. `docker history` shows the final stage and its runtime base history. The SDK build-stage layers are not retained. Use the build logs to inspect restore and publish, or build a separately tagged `--target build` image when investigating that stage.
+Record the image ID and size. Confirm that the formatted output reports `linux`, `amd64`, a nonzero user, and port `8080/tcp`. `docker history` shows the final stage and its runtime base history. The SDK build-stage layers are not retained. Use the build logs to inspect restore and publish, or build a separately tagged `--target build` image when investigating that stage.
 
 ### 6.3 Run a container
 
@@ -519,11 +530,15 @@ docker run `
 Test and inspect:
 
 ```powershell
+Invoke-RestMethod http://localhost:8080/health
 Invoke-RestMethod http://localhost:8080/api/info
 docker ps
 docker logs agent-api
 docker inspect agent-api --format '{{.Config.Image}}'
+docker inspect agent-api --format 'User={{.Config.User}} Ports={{json .NetworkSettings.Ports}}'
 ```
+
+If the first request races container startup, use `docker logs agent-api` to confirm that the application is listening on port `8080`, then retry. The health response should report `Healthy`; the info response should report version `v1`, default delay `500`, and a container machine name.
 
 ### 6.4 Remove only the container
 
@@ -537,13 +552,16 @@ The container is gone, but the reusable image remains.
 
 ### 6.5 Rebuild to observe caching
 
-Run the same build command again. Restore and unchanged layers should be cached. Change one message in `Program.cs`, rebuild, and observe that source-dependent steps run again while eligible earlier layers remain cached.
+Run the same build command again without changing the source. Restore, publish, and other unchanged eligible steps should report `CACHED` in the plain progress output.
+
+Optionally, make a temporary change to one message in `Program.cs` and rebuild to observe that source-dependent steps run again while earlier restore layers remain cached. Revert that temporary change and run the build once more before continuing, so `agent-api:v1` matches the checked-in source.
 
 ### Acceptance criteria
 
 - [ ] `docker build` creates `agent-api:v1` successfully.
+- [ ] Image inspection reports Linux AMD64, port `8080/tcp`, and a non-root configured user.
 - [ ] `docker history` shows the final runtime image history, including the published-output copy, not the SDK-stage restore/publish layers.
-- [ ] A container created from `agent-api:v1` returns HTTP 200 from `/api/info`.
+- [ ] A container created from `agent-api:v1` returns HTTP 200 from `/health` and `/api/info`.
 - [ ] The response reports `version = v1` and a container machine name.
 - [ ] Removing the container does not remove the image.
 - [ ] A second build demonstrates layer caching.
