@@ -1388,6 +1388,26 @@ The loader restores both ordinary PowerShell variables and the environment-varia
 
 **Purpose:** Demonstrate both configuration approaches used by the Learn exercise.
 
+Load the saved state and helper, then inspect the current scale configuration:
+
+```powershell
+$Root = (Get-Location).Path
+. ./.env.ps1
+. ./scripts/Common.ps1
+Assert-LabSubscription
+
+$BaselineRevision = Invoke-AzTsv -Arguments @(
+    'containerapp','show','-g',$ResourceGroup,'-n',$ContainerAppName,
+    '--query','properties.latestRevisionName'
+)
+Invoke-Native -File az -Arguments @(
+    'containerapp','show','-g',$ResourceGroup,'-n',$ContainerAppName,
+    '--query','properties.template.scale','--output','json'
+)
+```
+
+On the first run, the Step 10 baseline has minimum and maximum replicas set to `1` with no rules. On a rerun, inspect and understand the current configuration before applying another update. Run one deployment at a time; the helper intentionally fails if another deployment changes the latest revision during verification.
+
 ### 11.1 Apply the CLI scale rule
 
 ```powershell
@@ -1397,21 +1417,38 @@ Invoke-Native -File az -Arguments @(
     '--scale-rule-name','http-scaling','--scale-rule-type','http',
     '--scale-rule-http-concurrency','10','--output','table'
 )
-$VerifiedRevision = Invoke-AzTsv -Arguments @('containerapp','show','-g',$ResourceGroup,'-n',$ContainerAppName,'--query','properties.latestRevisionName')
-Wait-AppRevision -ExpectedRevision $VerifiedRevision -ExpectedImage $RegistryImage -MinReplicas 0 -MaxReplicas 10 -HttpScaling
+$CliRevision = Invoke-AzTsv -Arguments @(
+    'containerapp','show','-g',$ResourceGroup,'-n',$ContainerAppName,
+    '--query','properties.latestRevisionName'
+)
+Wait-AppRevision -ExpectedRevision $CliRevision -ExpectedImage $RegistryImage `
+    -MinReplicas 0 -MaxReplicas 10 -HttpScaling
 Invoke-Native -File az -Arguments @('containerapp','show','-g',$ResourceGroup,'-n',$ContainerAppName,'--query','properties.template.scale','--output','json')
 ```
 
-The target is HTTP concurrency, not total lifetime requests or CPU usage. Scaling is sampled and asynchronous; the threshold is not a hard request-admission limit or an instantaneous promise of another replica.
+The target is concurrent HTTP requests per replica, not total lifetime requests or CPU usage. Scaling is sampled and asynchronous; the threshold is not a hard request-admission limit or an instantaneous promise of another replica. With minimum replicas set to zero, the next request can experience a cold start. Step 12 measures actual scale-out and scale-in behavior under bounded load.
 
 ### 11.2 Generate and apply the equivalent YAML
 
 ```powershell
 $YamlPath = Write-AppYaml -MinReplicas 0 -MaxReplicas 10 -HttpScaling
 Get-Content $YamlPath
+$RevisionBeforeYaml = Invoke-AzTsv -Arguments @(
+    'containerapp','show','-g',$ResourceGroup,'-n',$ContainerAppName,
+    '--query','properties.latestRevisionName'
+)
 Invoke-Native -File az -Arguments @('containerapp','update','-g',$ResourceGroup,'-n',$ContainerAppName,'--yaml',$YamlPath,'--output','table')
-$VerifiedRevision = Invoke-AzTsv -Arguments @('containerapp','show','-g',$ResourceGroup,'-n',$ContainerAppName,'--query','properties.latestRevisionName')
-Wait-AppRevision -ExpectedRevision $VerifiedRevision -ExpectedImage $RegistryImage -MinReplicas 0 -MaxReplicas 10 -HttpScaling
+$YamlRevision = Invoke-AzTsv -Arguments @(
+    'containerapp','show','-g',$ResourceGroup,'-n',$ContainerAppName,
+    '--query','properties.latestRevisionName'
+)
+Wait-AppRevision -ExpectedRevision $YamlRevision -ExpectedImage $RegistryImage `
+    -MinReplicas 0 -MaxReplicas 10 -HttpScaling
+[pscustomobject]@{
+    RevisionBeforeYaml = $RevisionBeforeYaml
+    RevisionAfterYaml = $YamlRevision
+    RevisionReused = $RevisionBeforeYaml -eq $YamlRevision
+}
 ```
 
 Find this section in the generated file:
@@ -1427,7 +1464,49 @@ Find this section in the generated file:
               concurrentRequests: '10'
 ```
 
-This is an excerpt, not a standalone deployment file. Use the complete generated YAML, which preserves the lab's image, identity, probes, and ingress. To demonstrate a YAML change, edit `maxReplicas` in the generated file to `5`, apply it, capture `properties.latestRevisionName`, and call `Wait-AppRevision` with `-MinReplicas 0 -MaxReplicas 5 -HttpScaling` and the current image. Then regenerate/apply and verify the intended `0` to `10` configuration using the commands above. Do not leave the test limit in place.
+This is an excerpt, not a standalone deployment file. Use the complete generated YAML, which preserves the lab's image, identity, probes, resources, environment variables, and ingress. Reapplying equivalent YAML can reuse the current revision.
+
+Demonstrate a real YAML-scoped change and guarantee restoration of the intended final state:
+
+```powershell
+$RevisionBeforeTest = Invoke-AzTsv -Arguments @(
+    'containerapp','show','-g',$ResourceGroup,'-n',$ContainerAppName,
+    '--query','properties.latestRevisionName'
+)
+$TestRevision = $null
+
+try {
+    $TestYamlPath = Write-AppYaml -MinReplicas 0 -MaxReplicas 5 -HttpScaling
+    Invoke-Native -File az -Arguments @(
+        'containerapp','update','-g',$ResourceGroup,'-n',$ContainerAppName,
+        '--yaml',$TestYamlPath,'--output','table'
+    )
+    $TestRevision = Invoke-AzTsv -Arguments @(
+        'containerapp','show','-g',$ResourceGroup,'-n',$ContainerAppName,
+        '--query','properties.latestRevisionName'
+    )
+    if ($TestRevision -eq $RevisionBeforeTest) {
+        throw 'The 0/5 scale change did not create a new revision.'
+    }
+    Wait-AppRevision -ExpectedRevision $TestRevision -ExpectedImage $RegistryImage `
+        -MinReplicas 0 -MaxReplicas 5 -HttpScaling
+} finally {
+    $FinalYamlPath = Write-AppYaml -MinReplicas 0 -MaxReplicas 10 -HttpScaling
+    Invoke-Native -File az -Arguments @(
+        'containerapp','update','-g',$ResourceGroup,'-n',$ContainerAppName,
+        '--yaml',$FinalYamlPath,'--output','table'
+    )
+    $FinalRevision = Invoke-AzTsv -Arguments @(
+        'containerapp','show','-g',$ResourceGroup,'-n',$ContainerAppName,
+        '--query','properties.latestRevisionName'
+    )
+    if ($TestRevision -and $FinalRevision -eq $TestRevision) {
+        throw 'The final 0/10 restore did not create a new revision.'
+    }
+    Wait-AppRevision -ExpectedRevision $FinalRevision -ExpectedImage $RegistryImage `
+        -MinReplicas 0 -MaxReplicas 10 -HttpScaling
+}
+```
 
 Changing revision-scoped scale settings creates a new revision. Reapplying an identical configuration need not create another revision.
 
@@ -1435,7 +1514,8 @@ Changing revision-scoped scale settings creates a new revision. Reapplying an id
 
 - [ ] Effective scale JSON has minimum 0, maximum 10, and HTTP target 10.
 - [ ] You have applied and verified both CLI and YAML scale configuration.
-- [ ] A changed scale configuration produces a new revision.
+- [ ] The temporary 0/5 configuration and restored 0/10 configuration produce distinct verified revisions.
+- [ ] The final active configuration is restored to 0/10 with HTTP target 10.
 - [ ] Health probes and registry identity remain configured.
 
 ---
