@@ -1050,7 +1050,7 @@ function Wait-AppRevision {
         $revisionJson = Invoke-Native -File az -Arguments @('containerapp','revision','show','-g',$ResourceGroup,'-n',$ContainerAppName,'--revision',$ExpectedRevision,'--output','json')
         $revision = ($revisionJson | Out-String) | ConvertFrom-Json
         $p = $revision.properties
-        if ($p.provisioningState -in @('Failed','Deprovisioned')) {
+        if ($p.provisioningState -in @('Failed','Deprovisioned','ProvisioningFailed')) {
             throw "Revision $ExpectedRevision failed provisioning. Inspect system and console logs."
         }
         # A previously ready revision can legitimately be idle at zero replicas.
@@ -1090,7 +1090,7 @@ function Wait-Environment {
     do {
         $state = Invoke-AzTsv -Arguments @('containerapp','env','show','-g',$ResourceGroup,'-n',$ContainerAppsEnvironment,'--query','properties.provisioningState')
         if ($state -eq 'Succeeded') { return }
-        if ($state -eq 'Failed') { throw 'Environment provisioning failed. Inspect Azure deployment errors.' }
+        if ($state -in @('Failed','Canceled')) { throw 'Environment provisioning failed. Inspect Azure deployment errors.' }
         Start-Sleep 10
     } while ([DateTime]::UtcNow -lt $deadline)
     throw 'Environment readiness timed out. Inspect provisioning state before continuing.'
@@ -1131,7 +1131,9 @@ function Save-LabEnvironment {
     $settings | ConvertTo-Json | Set-Content (Join-Path $Root '.lab-settings.json')
     @'
 $settings = Get-Content (Join-Path $PSScriptRoot '.lab-settings.json') -Raw | ConvertFrom-Json
-foreach ($p in $settings.PSObject.Properties) { Set-Variable -Name $p.Name -Value $p.Value }
+foreach ($property in $settings.PSObject.Properties) {
+    Set-Variable -Name $property.Name -Value $property.Value
+}
 $env:RESOURCE_GROUP = $ResourceGroup
 $env:LOCATION = $Location
 $env:ACR_NAME = $AcrName
@@ -1238,52 +1240,88 @@ Load it from the repository root:
 
 ```powershell
 $Root = (Get-Location).Path
+. ./.env.ps1
 . ./scripts/Common.ps1
 $ContainerAppFqdn = ''
 $ContainerAppUrl = ''
 ```
 
+Load the saved settings before the helper because resource commands require the persisted subscription and names.
+
 ### 10.2 Create and verify the environment
 
 ```powershell
-Invoke-Native -File az -Arguments @('containerapp','env','create','-g',$ResourceGroup,'-n',$ContainerAppsEnvironment,'--location',$Location,'--output','table')
+$ExistingEnvironment = Invoke-AzTsv -Arguments @(
+    'containerapp','env','list','-g',$ResourceGroup,
+    '--query',"[?name=='$ContainerAppsEnvironment'].name | [0]"
+)
+if (-not $ExistingEnvironment) {
+    Invoke-Native -File az -Arguments @(
+        'containerapp','env','create','-g',$ResourceGroup,'-n',$ContainerAppsEnvironment,
+        '--location',$Location,'--output','table'
+    )
+}
 Wait-Environment
 ```
 
-The environment command provisions monitoring resources unless configured otherwise. Keep this lab in its own resource group and inspect the resulting resources.
+Before reusing an existing environment, inspect its location and resource ID and stop if it is not the dedicated lab environment. Azure may return the display location `Australia East` even though the CLI input is the canonical name `australiaeast`; resolve the display name with `az account list-locations` instead of comparing those two strings directly. The create command can take several minutes and provisions a Log Analytics workspace unless configured otherwise. Container Apps Consumption usage and Log Analytics ingestion/retention can incur charges; there is not a fixed environment fee implied by this tutorial.
 
 ### 10.3 Bootstrap with a public image
 
 ```powershell
-Invoke-Native -File az -Arguments @(
-    'containerapp','create','-g',$ResourceGroup,'-n',$ContainerAppName,
-    '--environment',$ContainerAppsEnvironment,
-    '--image','mcr.microsoft.com/k8se/quickstart:latest',
-    '--system-assigned','--ingress','external','--target-port','80',
-    '--min-replicas','1','--max-replicas','1','--output','table'
+$ExistingApp = Invoke-AzTsv -Arguments @(
+    'containerapp','list','-g',$ResourceGroup,
+    '--query',"[?name=='$ContainerAppName'].name | [0]"
 )
+if (-not $ExistingApp) {
+    Invoke-Native -File az -Arguments @(
+        'containerapp','create','-g',$ResourceGroup,'-n',$ContainerAppName,
+        '--environment',$ContainerAppsEnvironment,
+        '--image','mcr.microsoft.com/k8se/quickstart:latest',
+        '--system-assigned','--ingress','external','--target-port','80',
+        '--min-replicas','1','--max-replicas','1','--output','table'
+    )
+}
+
 $PrincipalId = Invoke-AzTsv -Arguments @('containerapp','identity','show','-g',$ResourceGroup,'-n',$ContainerAppName,'--query','principalId')
 $AcrId = Invoke-AzTsv -Arguments @('acr','show','-g',$ResourceGroup,'-n',$AcrName,'--query','id')
 if (-not $PrincipalId) { throw 'System-assigned identity was not created.' }
-Invoke-Native -File az -Arguments @('role','assignment','create','--assignee-object-id',$PrincipalId,'--assignee-principal-type','ServicePrincipal','--role','AcrPull','--scope',$AcrId,'--output','table')
+
+$ExistingAcrPull = Invoke-AzTsv -Arguments @(
+    'role','assignment','list','--assignee',$PrincipalId,'--scope',$AcrId,'--role','AcrPull',
+    '--query','[0].id'
+)
+if (-not $ExistingAcrPull) {
+    Invoke-Native -File az -Arguments @(
+        'role','assignment','create','--assignee-object-id',$PrincipalId,
+        '--assignee-principal-type','ServicePrincipal','--role','AcrPull',
+        '--scope',$AcrId,'--output','table'
+    )
+}
 ```
 
-The public image temporarily listens on port 80. The private application configuration below switches ingress and probes to 8080 together. No registry admin credentials are used.
+Before reusing an existing app, verify its environment ID and system identity match this lab. The public image temporarily listens on port 80. The private application configuration below switches ingress and probes to 8080 together. The role assignment is scoped only to this registry; no registry admin credentials are used.
 
 ### 10.4 Check ACR authentication and configure registry access
 
 ```powershell
-Invoke-Native -File az -Arguments @('acr','config','authentication-as-arm','show','-r',$AcrName)
+$ArmAuthenticationStatus = Invoke-AzTsv -Arguments @(
+    'acr','config','authentication-as-arm','show','-r',$AcrName,'--query','status'
+)
 ```
 
 ARM-audience tokens must be enabled for managed-identity image pull. If disabled, obtain approval before changing a policy-controlled registry. For this dedicated lab registry, enable them if needed:
 
 ```powershell
-Invoke-Native -File az -Arguments @('acr','config','authentication-as-arm','update','-r',$AcrName,'--status','enabled')
+if ($ArmAuthenticationStatus -ne 'enabled') {
+    Invoke-Native -File az -Arguments @(
+        'acr','config','authentication-as-arm','update','-r',$AcrName,'--status','enabled'
+    )
+}
 Invoke-Native -File az -Arguments @('containerapp','registry','set','-g',$ResourceGroup,'-n',$ContainerAppName,'--server',$AcrLoginServer,'--identity','system')
 ```
 
-Role propagation is asynchronous. Allow a few minutes before the first private-image deployment. If it fails, inspect the error and role scope, wait for propagation, then rerun the deployment below. Do not recreate the identity or grant broader roles blindly.
+Role propagation is asynchronous. Deploy and verify the intended revision with the bounded helper. If it fails specifically with image-pull authorization evidence, inspect the role scope and system logs, allow propagation, and retry the deployment once. Do not recreate the identity, duplicate the role assignment, or grant broader roles blindly.
 
 ### 10.5 Apply private image, resources, ingress, and HTTP probes
 
@@ -1294,6 +1332,16 @@ $ContainerAppFqdn = Invoke-AzTsv -Arguments @('containerapp','show','-g',$Resour
 $ContainerAppUrl = "https://$ContainerAppFqdn"
 Wait-Agent -Url $ContainerAppUrl -ExpectedVersion $ImageTag
 Save-LabEnvironment
+
+Invoke-Native -File az -Arguments @(
+    'containerapp','show','-g',$ResourceGroup,'-n',$ContainerAppName,
+    '--query','{latest:properties.latestRevisionName,ready:properties.latestReadyRevisionName,image:properties.template.containers[0].image,targetPort:properties.configuration.ingress.targetPort,registries:properties.configuration.registries,probes:properties.template.containers[0].probes,scale:properties.template.scale}',
+    '--output','json'
+)
+Invoke-Native -File az -Arguments @(
+    'role','assignment','list','--assignee',$PrincipalId,'--scope',$AcrId,'--role','AcrPull',
+    '--output','table'
+)
 ```
 
 Inspect the generated YAML: it declares the system identity, registry authentication, single-revision traffic, private image, 0.5 vCPU/1 GiB, port 8080, and explicit startup/readiness/liveness HTTP probes against `/health`. Creating the endpoint alone would not configure these probes. The health response is deliberately simple because this mock API has no external dependencies.
@@ -1329,6 +1377,7 @@ The loader restores both ordinary PowerShell variables and the environment-varia
 - [ ] The environment reports `Succeeded`.
 - [ ] A system-assigned identity exists before private-image deployment.
 - [ ] Its registry-scoped `AcrPull` assignment exists and registry authentication uses `system`.
+- [ ] ACR admin credentials remain disabled and no registry username/password secret is configured.
 - [ ] Ingress and all three HTTP probes target port 8080.
 - [ ] `/api/info` returns `v1`, `/health` succeeds, and the new revision is healthy.
 - [ ] A new terminal can restore all lab variables.
