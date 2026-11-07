@@ -768,10 +768,47 @@ Both files are excluded by `.gitignore` and `.dockerignore`. In a new terminal a
 
 **Purpose:** Understand the boundary between a local image and an image stored in ACR.
 
+Restore the saved names and verify that the active Azure and Docker contexts still contain the expected resources:
+
+```powershell
+. ./.env.ps1
+
+$ActualSubscription = az account show --query id --output tsv
+if ($ActualSubscription -ne $SubscriptionId) {
+    throw 'The active Azure subscription does not match the saved lab subscription.'
+}
+
+$LocalImageId = docker image inspect agent-api:v1 --format '{{.Id}}'
+$LocalPlatform = docker image inspect agent-api:v1 --format '{{.Os}}/{{.Architecture}}'
+if (-not $LocalImageId -or $LocalPlatform -ne 'linux/amd64') {
+    throw 'The expected local Linux AMD64 image agent-api:v1 is unavailable.'
+}
+
+$Repositories = @(az acr repository list --subscription $SubscriptionId `
+    --name $AcrName --output json | ConvertFrom-Json)
+if ($Repositories -contains $ImageRepository) {
+    $ExistingTags = @(az acr repository show-tags --subscription $SubscriptionId `
+        --name $AcrName --repository $ImageRepository --output json | ConvertFrom-Json)
+    if ($ExistingTags -contains $ImageTag) {
+        throw "Remote tag ${ImageRepository}:${ImageTag} already exists. Inspect its digest before deciding whether to replace it."
+    }
+}
+
+az acr login --name $AcrName --subscription $SubscriptionId
+```
+
+Docker images persist in the active Docker engine across PowerShell sessions. In a new terminal, restore the variables with `. ./.env.ps1` and verify that the same Docker context still contains `agent-api:v1`. If authentication has expired, rerun `az acr login`; do not enable the ACR admin account.
+
 ### 8.1 Add a registry-qualified tag
 
 ```powershell
 docker tag agent-api:v1 $RegistryImage
+
+$QualifiedImageId = docker image inspect $RegistryImage --format '{{.Id}}'
+if ($QualifiedImageId -ne $LocalImageId) {
+    throw 'The local and registry-qualified tags do not reference the same image.'
+}
+
 docker image ls agent-api
 docker image ls $AcrLoginServer/agent-api
 ```
@@ -785,6 +822,7 @@ docker push $RegistryImage
 ```
 
 Docker uploads missing layers, then publishes an image manifest and associates `v1` with it.
+If the push reports an authentication error, rerun `az acr login` and retry. If it reports an authorization error, verify that your identity has an appropriate registry data-plane role such as `AcrPush`; do not enable admin credentials as a workaround.
 
 ### 8.3 Inspect the repository and digest
 
@@ -803,16 +841,35 @@ az acr manifest list-metadata --subscription $SubscriptionId `
     --registry $AcrName `
     --name $ImageRepository `
     --output table
+
+$DigestV1 = az acr repository show --subscription $SubscriptionId `
+    --name $AcrName `
+    --image "${ImageRepository}:${ImageTag}" `
+    --query digest `
+    --output tsv
+
+$TagDigest = az acr repository show-tags --subscription $SubscriptionId `
+    --name $AcrName `
+    --repository $ImageRepository `
+    --detail `
+    --query "[?name=='$ImageTag'].digest | [0]" `
+    --output tsv
+
+if ($DigestV1 -notmatch '^sha256:[0-9a-f]{64}$' -or $TagDigest -ne $DigestV1) {
+    throw 'The pushed tag and repository metadata do not identify the same manifest digest.'
+}
+$DigestV1
 ```
 
-The tag `v1` is readable but mutable. The manifest digest identifies specific image content.
+The tag `v1` is readable but mutable. The manifest digest identifies specific image content. `az acr manifest` is currently a preview command group; the digest returned by `az acr repository show` is the authoritative value used later in this tutorial. The local Docker image ID and registry manifest digest are different concepts even when an implementation reports the same hash value.
 
 ### Acceptance criteria
 
 - [ ] The local image has both `agent-api:v1` and the registry-qualified tag.
+- [ ] Both local tags resolve to the same image ID and the image platform is Linux AMD64.
 - [ ] `docker push` completes successfully.
 - [ ] ACR contains repository `agent-api` and tag `v1`.
-- [ ] You can identify the image manifest digest.
+- [ ] `$DigestV1` is a `sha256:` manifest digest and agrees with detailed tag metadata.
 - [ ] You can explain that ACR stores the image but does not run it.
 
 ---
