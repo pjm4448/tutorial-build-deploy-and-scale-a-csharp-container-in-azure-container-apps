@@ -583,9 +583,32 @@ $ContainerAppName = "agent-api"
 $ImageRepository = "agent-api"
 $ImageTag = "v1"
 
-$SubscriptionId = az account show --query id --output tsv
+$Account = az account show --output json | ConvertFrom-Json
+$SubscriptionId = $Account.id
+$TenantId = $Account.tenantId
+if (-not $SubscriptionId -or -not $TenantId) {
+    throw 'Unable to determine the active Azure subscription and tenant.'
+}
+$Account | Select-Object name, id, tenantId, user
+
 $UserObjectId = az ad signed-in-user show --query id --output tsv
 if (-not $UserObjectId) { throw "Unable to determine the signed-in user. Run az login." }
+
+$AcrProviderState = az provider show --subscription $SubscriptionId `
+    --namespace Microsoft.ContainerRegistry --query registrationState --output tsv
+if ($AcrProviderState -ne 'Registered') {
+    throw 'Microsoft.ContainerRegistry is not registered in the active subscription.'
+}
+
+$LocationDisplayName = az account list-locations --subscription $SubscriptionId `
+    --query "[?name=='$Location'].displayName | [0]" --output tsv
+$AcrLocations = az provider show --subscription $SubscriptionId `
+    --namespace Microsoft.ContainerRegistry `
+    --query "resourceTypes[?resourceType=='registries'].locations | [0]" `
+    --output json | ConvertFrom-Json
+if (-not $LocationDisplayName -or $AcrLocations -notcontains $LocationDisplayName) {
+    throw "Azure Container Registry is not available in $Location."
+}
 
 $Sha1 = [System.Security.Cryptography.SHA1]::Create()
 $HashBytes = $Sha1.ComputeHash([System.Text.Encoding]::UTF8.GetBytes("$UserObjectId/$SubscriptionId/$ResourceGroup"))
@@ -599,6 +622,38 @@ $AcrName
 $ContainerAppsEnvironment
 ```
 
+Confirm that the displayed subscription and tenant are the ones selected in Step 1 before continuing.
+
+Check for existing resources and global ACR name availability before creating anything:
+
+```powershell
+$GroupExists = (az group exists --subscription $SubscriptionId --name $ResourceGroup) -eq 'true'
+if ($GroupExists) {
+    $ExistingLocation = az group show --subscription $SubscriptionId `
+        --name $ResourceGroup --query location --output tsv
+    if ($ExistingLocation -ne $Location) {
+        throw "Resource group $ResourceGroup already exists in $ExistingLocation, not $Location."
+    }
+}
+
+$ExistingAcr = az acr list --subscription $SubscriptionId `
+    --query "[?name=='$AcrName'] | [0]" --output json | ConvertFrom-Json
+
+if ($ExistingAcr) {
+    if ($ExistingAcr.resourceGroup -ne $ResourceGroup) {
+        throw "Registry $AcrName already exists in another resource group."
+    }
+} else {
+    $NameCheck = az acr check-name --subscription $SubscriptionId `
+        --name $AcrName --output json | ConvertFrom-Json
+    if (-not $NameCheck.nameAvailable) {
+        throw "Registry name $AcrName is unavailable: $($NameCheck.message)"
+    }
+}
+```
+
+Do not silently reuse a resource group or registry whose ownership or configuration is uncertain. If the globally unique registry name is unavailable outside your subscription, choose another lowercase alphanumeric name and persist that choice below.
+
 ### 7.2 Create the resource group and ACR
 
 ```powershell
@@ -607,19 +662,33 @@ az group create --subscription $SubscriptionId `
     --location $Location `
     --output table
 
-az acr create --subscription $SubscriptionId `
-    --resource-group $ResourceGroup `
-    --name $AcrName `
-    --sku Basic `
-    --role-assignment-mode rbac `
-    --admin-enabled false `
-    --output table
+if (-not $ExistingAcr) {
+    az acr create --subscription $SubscriptionId `
+        --resource-group $ResourceGroup `
+        --name $AcrName `
+        --sku Basic `
+        --role-assignment-mode rbac `
+        --admin-enabled false `
+        --output table
+}
 
-$AcrLoginServer = az acr show --subscription $SubscriptionId `
+$Registry = az acr show --subscription $SubscriptionId `
     --resource-group $ResourceGroup `
     --name $AcrName `
-    --query loginServer `
-    --output tsv
+    --output json | ConvertFrom-Json
+
+if ($Registry.provisioningState -ne 'Succeeded' -or
+    $Registry.location -ne $Location -or
+    $Registry.sku.name -ne 'Basic' -or
+    $Registry.adminUserEnabled -ne $false -or
+    $Registry.roleAssignmentMode -ne 'LegacyRegistryPermissions') {
+    throw 'The registry does not match the required location, SKU, admin, provisioning, or RBAC settings.'
+}
+
+$AcrLoginServer = $Registry.loginServer
+if ($AcrLoginServer -notlike '*.azurecr.io') {
+    throw 'Unexpected ACR login server.'
+}
 
 $RegistryImage = "$AcrLoginServer/${ImageRepository}:$ImageTag"
 $RegistryImage
@@ -628,17 +697,10 @@ $RegistryImage
 Check the registry uses ordinary registry RBAC, not repository ABAC:
 
 ```powershell
-az acr show --name $AcrName --query roleAssignmentMode --output tsv --subscription $SubscriptionId
+$Registry.roleAssignmentMode
 ```
 
-Both creation paths explicitly select `--role-assignment-mode rbac`. This lab expects `LegacyRegistryPermissions` (registry RBAC). Enforce that prerequisite before continuing:
-
-```powershell
-$RegistryMode = az acr show --name $AcrName --subscription $SubscriptionId --query roleAssignmentMode --output tsv
-if ($RegistryMode -ne 'LegacyRegistryPermissions') {
-    throw 'This lab requires registry RBAC. Use a dedicated RBAC-mode registry; do not change a shared registry blindly.'
-}
-```
+The `--role-assignment-mode rbac` input is reported by the service as `LegacyRegistryPermissions`. This is ordinary registry RBAC, not repository ABAC.
 
 If an existing registry uses repository ABAC, do not assume `AcrPull`/`AcrPush` apply; use a separate lab registry or obtain an approved role design. If the generated registry name is unavailable, choose another lowercase alphanumeric name and use it consistently.
 
@@ -652,13 +714,53 @@ az acr login --name $AcrName --subscription $SubscriptionId
 
 If login or push fails with authorization errors, ensure your identity has an appropriate ACR data-plane role, such as `AcrPush`, for this lab's registry permission mode.
 
+### 7.4 Persist settings for later terminals
+
+Save these non-secret values now so Steps 8–10 do not depend on keeping this PowerShell session open. The deployment helper created in Step 10 uses the same schema and later fills in the application endpoint values.
+
+```powershell
+$Root = (Get-Location).Path
+$ContainerAppFqdn = ''
+$ContainerAppUrl = ''
+
+$LabSettings = [ordered]@{
+    SubscriptionId=$SubscriptionId; Location=$Location; ResourceGroup=$ResourceGroup
+    ContainerAppName=$ContainerAppName; ImageRepository=$ImageRepository; ImageTag=$ImageTag
+    AcrName=$AcrName; AcrLoginServer=$AcrLoginServer
+    ContainerAppsEnvironment=$ContainerAppsEnvironment; RegistryImage=$RegistryImage
+    ContainerAppFqdn=$ContainerAppFqdn; ContainerAppUrl=$ContainerAppUrl
+}
+$LabSettings | ConvertTo-Json | Set-Content (Join-Path $Root '.lab-settings.json')
+
+@'
+$settings = Get-Content (Join-Path $PSScriptRoot '.lab-settings.json') -Raw | ConvertFrom-Json
+foreach ($property in $settings.PSObject.Properties) {
+    Set-Variable -Name $property.Name -Value $property.Value
+}
+$env:RESOURCE_GROUP = $ResourceGroup
+$env:LOCATION = $Location
+$env:ACR_NAME = $AcrName
+$env:ACR_LOGIN_SERVER = $AcrLoginServer
+$env:ACA_ENVIRONMENT = $ContainerAppsEnvironment
+$env:CONTAINER_APP_NAME = $ContainerAppName
+$env:CONTAINER_APP_FQDN = $ContainerAppFqdn
+$env:CONTAINER_APP_URL = $ContainerAppUrl
+$env:CONTAINER_IMAGE = $RegistryImage
+Remove-Variable settings
+'@ | Set-Content (Join-Path $Root '.env.ps1')
+```
+
+Both files are excluded by `.gitignore` and `.dockerignore`. In a new terminal at the repository root, restore the values with `. ./.env.ps1`; the loader does not change the active Azure subscription.
+
 ### Acceptance criteria
 
+- [ ] The active tenant, subscription, provider registration, region, existing resources, and ACR name availability are verified before creation.
 - [ ] The resource group exists in `australiaeast` or your selected supported region.
-- [ ] A Basic ACR exists with the admin account disabled.
+- [ ] A Basic ACR reports `Succeeded`, `LegacyRegistryPermissions`, and an admin account that remains disabled.
 - [ ] `$AcrLoginServer` ends with `.azurecr.io`.
 - [ ] `$RegistryImage` has the form `<registry>.azurecr.io/agent-api:v1`.
 - [ ] `az acr login` succeeds without using the ACR admin account.
+- [ ] `. ./.env.ps1` restores the same non-secret subscription, resource, and image values in a new terminal.
 
 ---
 
