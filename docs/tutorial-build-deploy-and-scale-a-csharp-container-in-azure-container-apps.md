@@ -1679,6 +1679,37 @@ If scale-out is absent, inspect effective scale JSON, active/ready revision, suc
 
 ## Step 13: Change source, build v2, and verify the release
 
+Load the current v1 state and protect the mutable v2 tag before changing source:
+
+```powershell
+$Root = (Get-Location).Path
+. ./.env.ps1
+. ./scripts/Common.ps1
+Assert-LabSubscription
+
+$RevisionBeforeV2 = Invoke-AzTsv -Arguments @(
+    'containerapp','show','-g',$ResourceGroup,'-n',$ContainerAppName,
+    '--query','properties.latestRevisionName'
+)
+$DigestV1 = Invoke-AzTsv -Arguments @(
+    'acr','repository','show','-n',$AcrName,'--image',"${ImageRepository}:v1",'--query','digest'
+)
+if ($DigestV1 -notmatch '^sha256:[0-9a-f]{64}$') {
+    throw 'The v1 manifest digest is unavailable.'
+}
+
+docker image inspect agent-api:v2 *> $null
+if ($LASTEXITCODE -eq 0) { throw 'Local tag agent-api:v2 already exists. Inspect it before replacing it.' }
+docker image inspect "$AcrLoginServer/${ImageRepository}:v2" *> $null
+if ($LASTEXITCODE -eq 0) { throw 'The local registry-qualified v2 tag already exists.' }
+
+$ExistingTags = @(az acr repository show-tags --subscription $SubscriptionId `
+    --name $AcrName --repository $ImageRepository --output json | ConvertFrom-Json)
+if ($ExistingTags -contains 'v2') {
+    throw 'Remote tag v2 already exists. Inspect its digest before deciding whether to replace it.'
+}
+```
+
 ### 13.1 Make a mandatory source change before building
 
 In `src/Agent.Api/Program.cs`, replace the root endpoint message:
@@ -1692,34 +1723,103 @@ Keep all other endpoints unchanged. `APP_VERSION` remains deployment configurati
 ### 13.2 Build and push a distinct image
 
 ```powershell
-$DigestV1 = Invoke-AzTsv -Arguments @('acr','repository','show','-n',$AcrName,'--image',"${ImageRepository}:v1",'--query','digest')
+$SourceMessageV2 = 'C# API running in Azure Container Apps - release v2'
+dotnet build --configuration Release --no-restore
+
 $ImageTag = 'v2'
 $RegistryImage = "$AcrLoginServer/${ImageRepository}:$ImageTag"
-Invoke-Native -File docker -Arguments @('build','--platform','linux/amd64','--file','./src/Agent.Api/Dockerfile','--tag','agent-api:v2','.')
+Invoke-Native -File docker -Arguments @(
+    'build','--platform','linux/amd64','--progress=plain',
+    '--file','./src/Agent.Api/Dockerfile','--tag','agent-api:v2','.'
+)
+
+$ImagePlatform = docker image inspect agent-api:v2 --format '{{.Os}}/{{.Architecture}}'
+if ($ImagePlatform -ne 'linux/amd64') { throw 'The v2 image platform is not Linux AMD64.' }
+
+$ExistingTestContainer = docker ps --all --filter 'name=^/agent-api-v2-test$' --format '{{.Names}}'
+if ($ExistingTestContainer) { throw 'The disposable v2 test container already exists.' }
+if (Get-NetTCPConnection -LocalPort 8080 -State Listen -ErrorAction SilentlyContinue) {
+    throw 'Host port 8080 is already in use.'
+}
+
+try {
+    Invoke-Native -File docker -Arguments @(
+        'run','--detach','--name','agent-api-v2-test','--publish','8080:8080',
+        '--env','APP_VERSION=v2','--env','AGENT_DEFAULT_DELAY_MS=500','agent-api:v2'
+    )
+    $LocalDeadline = [DateTime]::UtcNow.AddSeconds(30)
+    do {
+        try {
+            $LocalHealth = Invoke-RestMethod 'http://localhost:8080/health' -TimeoutSec 5
+            if ($LocalHealth.status -eq 'Healthy') { break }
+        } catch {
+            if ([DateTime]::UtcNow -ge $LocalDeadline) { throw }
+        }
+        Start-Sleep 1
+    } while ([DateTime]::UtcNow -lt $LocalDeadline)
+    if ($LocalHealth.status -ne 'Healthy') { throw 'The local v2 container did not become ready.' }
+
+    $LocalRoot = Invoke-RestMethod 'http://localhost:8080/' -TimeoutSec 30
+    $LocalInfo = Invoke-RestMethod 'http://localhost:8080/api/info' -TimeoutSec 30
+    if ($LocalRoot.message -ne $SourceMessageV2 -or $LocalInfo.version -ne 'v2' -or
+        $LocalHealth.status -ne 'Healthy') {
+        throw 'The local v2 container did not prove the expected source and configuration.'
+    }
+} finally {
+    docker stop agent-api-v2-test 2>$null | Out-Null
+    docker rm agent-api-v2-test 2>$null | Out-Null
+}
+
 Invoke-Native -File docker -Arguments @('tag','agent-api:v2',$RegistryImage)
 Invoke-Native -File az -Arguments @('acr','login','--name',$AcrName)
 Invoke-Native -File docker -Arguments @('push',$RegistryImage)
 $DigestV2 = Invoke-AzTsv -Arguments @('acr','repository','show','-n',$AcrName,'--image',"${ImageRepository}:v2",'--query','digest')
-if (-not $DigestV2 -or $DigestV1 -eq $DigestV2) { throw 'Expected a different image digest after the mandatory source change.' }
+if ($DigestV2 -notmatch '^sha256:[0-9a-f]{64}$' -or $DigestV1 -eq $DigestV2) {
+    throw 'Expected a distinct v2 image digest after the mandatory source change.'
+}
 ```
+
+The unchanged SDK, project, and restore layers should be eligible for cache reuse, while the source-copy and publish layers must run again. The local container test proves the compiled message before the image is uploaded.
 
 ### 13.3 Deploy and verify code, configuration, and revision
 
 ```powershell
 Publish-AppConfiguration -MinReplicas 0 -MaxReplicas 10 -HttpScaling
+$RevisionV2 = $VerifiedRevision
+if ($RevisionV2 -eq $RevisionBeforeV2) { throw 'The v2 deployment did not create a new revision.' }
 Wait-Agent -Url $ContainerAppUrl -ExpectedVersion v2 -ExpectedMessage 'C# API running in Azure Container Apps - release v2'
-Invoke-Native -File az -Arguments @('containerapp','revision','list','-g',$ResourceGroup,'-n',$ContainerAppName,'--query','[].{name:name,active:properties.active,image:properties.template.containers[0].image}','--output','table')
+Invoke-Native -File az -Arguments @(
+    'containerapp','show','-g',$ResourceGroup,'-n',$ContainerAppName,
+    '--query','{latest:properties.latestRevisionName,ready:properties.latestReadyRevisionName,image:properties.template.containers[0].image,scale:properties.template.scale,probes:properties.template.containers[0].probes,registry:properties.configuration.registries[0]}',
+    '--output','json'
+)
 Save-LabEnvironment
 ```
 
-Single-revision mode moves traffic when the new revision is ready. No fixed revision suffix is used, avoiding collisions when rerunning the exercise. Preserve `v1` and `v2` as separate lab release tags. Production pipelines should use immutable commit/build tags or digests and promote the same artifact between environments. A mutable tag alone is not an immutable release identity.
+Single-revision mode keeps v1 serving until the v2 revision is ready, then moves traffic. Save the v2 settings only after both version and exact compiled-message checks pass. No fixed revision suffix is used, avoiding revision-name collisions when rerunning the exercise. Preserve `v1` and `v2` as separate lab release tags. Production pipelines should use immutable commit/build tags or digests and promote the same artifact between environments. A mutable tag alone is not an immutable release identity.
+
+### 13.4 Roll back to v1 if v2 verification fails
+
+Before a successful `Save-LabEnvironment`, the persisted loader still points to v1. Reload it, redeploy, and verify v1 only when a failed or partial v2 rollout requires rollback:
+
+```powershell
+. ./.env.ps1
+. ./scripts/Common.ps1
+Publish-AppConfiguration -MinReplicas 0 -MaxReplicas 10 -HttpScaling
+Wait-Agent -Url $ContainerAppUrl -ExpectedVersion v1
+Save-LabEnvironment
+```
+
+Do not delete the failed v2 image or revision automatically; retain them as diagnostic evidence.
 
 ### Acceptance criteria
 
 - [ ] `v1` and `v2` exist in ACR and their digests differ.
+- [ ] The local Linux AMD64 v2 container returns the exact compiled release-v2 message before push.
 - [ ] The new revision references `v2`.
 - [ ] `/api/info` reports `v2` and `/` returns the changed source message.
 - [ ] Scaling, HTTP probes, and managed-identity registry access remain configured.
+- [ ] A new terminal restores `ImageTag = v2` and the registry-qualified v2 image.
 
 ---
 

@@ -15,7 +15,7 @@ app.MapGet("/", () => Results.Ok(new
 {
 	service = "agent-api",
 	version,
-	message = "C# API running in Azure Container Apps"
+	message = "C# API running in Azure Container Apps - release v2"
 }));
 
 app.MapGet("/health", () => Results.Ok(new { status = "Healthy" }));
