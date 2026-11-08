@@ -1995,6 +1995,8 @@ Run from the repository root:
 ./scripts/Deploy-AcaScale.ps1
 ```
 
+The checked implementation in `scripts/Deploy-AcaScale.ps1` is the executable source for this menu. It loads `.env.ps1` before `Common.ps1`, validates the saved subscription and registry (`LegacyRegistryPermissions`, admin disabled), uses exit-code-based Docker tag checks, requires `OVERWRITE` before replacing an existing mutable tag, reuses only compatible resources, and verifies cleanup rather than assuming deletion is immediate. The read-only status path (option 7) reports the current image digest, ready revision, scale rule, endpoint, and recent system logs; option 9 exits without changing resources.
+
 For a fresh deployment, choose **1, then 2 (or 3), then 4, 5, 6, and 7**. On an existing lab, saved settings are reused and the registry login server is always queried. To select a new release tag, exit and restart with `-ImageTag v2`; make the source change before building. Do not rebuild a previously deployed release tag as a normal release practice.
 
 **Release-validation boundary:** Menu options 5 and 6 verify the exact intended revision, image reference, replica bounds, HTTP rule where enabled, endpoint version, and health. They do not independently prove that a new source change was compiled into the image: `APP_VERSION` is deployment configuration. For every new release, Step 13 remains mandatory, including the source change, pre/post image-digest comparison, and `Wait-Agent -ExpectedMessage` check. A menu-only deployment is a deployment/availability check, not completed new-release validation.
