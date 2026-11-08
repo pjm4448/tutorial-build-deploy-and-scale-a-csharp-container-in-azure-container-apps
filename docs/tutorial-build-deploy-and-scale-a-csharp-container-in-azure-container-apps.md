@@ -1031,6 +1031,15 @@ function Assert-LabSubscription {
         throw "Active subscription differs from saved lab subscription $SubscriptionId. Select it explicitly before continuing."
     }
 }
+function Get-ReplicaCount {
+    param([Parameter(Mandatory)][string]$Revision)
+    # Parse JSON locally. Passing JMESPath length(@) through az.cmd can fail on Windows.
+    $replicaJson = Invoke-Native -File az -Arguments @(
+        'containerapp','replica','list','-g',$ResourceGroup,'-n',$ContainerAppName,
+        '--revision',$Revision,'--output','json'
+    )
+    @((($replicaJson | Out-String) | ConvertFrom-Json)).Count
+}
 function Wait-AppRevision {
     param(
         [Parameter(Mandatory)][string]$ExpectedRevision,
@@ -1550,7 +1559,7 @@ $results = 1..$Parallelism | ForEach-Object -Parallel {
             [void]$machines.Add([string]$response.machine)
         } catch {
             $failed++
-            if ($errors.Count -lt 3) { $errors.Add($_.Exception.Message) }
+            if ($errors.Count -lt 3) { [void]$errors.Add($_.Exception.Message) }
             Start-Sleep -Milliseconds 500
         }
     }
@@ -1560,10 +1569,14 @@ $watch.Stop()
 $successes = ($results | Measure-Object Succeeded -Sum).Sum
 $failures = ($results | Measure-Object Failed -Sum).Sum
 $machines = @($results | ForEach-Object {$_.Machines} | Sort-Object -Unique)
+$elapsedSeconds = [Math]::Round($watch.Elapsed.TotalSeconds,2)
 [pscustomobject]@{
     Succeeded=$successes; Failed=$failures; Parallelism=$Parallelism
     RequestedDurationSeconds=$DurationSeconds
-    ElapsedSeconds=[Math]::Round($watch.Elapsed.TotalSeconds,2)
+    ElapsedSeconds=$elapsedSeconds
+    SuccessfulRequestsPerSecond=if ($elapsedSeconds -gt 0) {
+        [Math]::Round($successes / $elapsedSeconds,2)
+    } else { 0 }
     MachinesObserved=$machines.Count; Machines=($machines -join ', ')
 }
 if ($failures -gt 0) {
@@ -1573,7 +1586,7 @@ if ($failures -gt 0) {
 if ($successes -eq 0) { throw 'No requests succeeded.' }
 ```
 
-The script starts at most 100 workers for at most 600 seconds. Requests already in progress can finish after the duration deadline, up to their timeout. Use only against your own lab endpoint. The public API is unauthenticated for this exercise; it is not a production security design.
+The script starts at most 100 workers for at most 600 seconds. Requests already in progress can finish after the duration deadline, so elapsed time can exceed the requested duration by up to a request timeout. Any failed request makes this strict tutorial test fail; inspect the emitted error samples before retrying. Use only against your own lab endpoint. The public API is unauthenticated for this exercise; it is not a production security design.
 
 ### 12.2 Warm up and select the revision
 
@@ -1598,12 +1611,30 @@ In a second terminal, restore the session using Step 10.6. Resolve the ready rev
 $VerifiedRevision = Invoke-AzTsv -Arguments @('containerapp','show','-g',$ResourceGroup,'-n',$ContainerAppName,'--query','properties.latestRevisionName')
 Wait-AppRevision -ExpectedRevision $VerifiedRevision -ExpectedImage $RegistryImage -MinReplicas 0 -MaxReplicas 10 -HttpScaling
 $TestRevision = $VerifiedRevision
-$MonitorUntil = [DateTime]::UtcNow.AddMinutes(12)
+$MonitorUntil = [DateTime]::UtcNow.AddMinutes(15)
+$ReplicaSamples = [Collections.Generic.List[object]]::new()
+$PeakReplicas = 0
+$FirstScaleOutUtc = $null
+$ZeroAfterScaleOutUtc = $null
 while ([DateTime]::UtcNow -lt $MonitorUntil) {
-    $count = Invoke-AzTsv -Arguments @('containerapp','replica','list','-g',$ResourceGroup,'-n',$ContainerAppName,'--revision',$TestRevision,'--query','length(@)')
-    Write-Host "$(Get-Date -Format HH:mm:ss) revision=$TestRevision replicas=$count"
+    $sampleTime = [DateTime]::UtcNow
+    $count = Get-ReplicaCount -Revision $TestRevision
+    [void]$ReplicaSamples.Add([pscustomobject]@{TimeUtc=$sampleTime; Replicas=$count})
+    $PeakReplicas = [Math]::Max($PeakReplicas,[int]$count)
+    if (-not $FirstScaleOutUtc -and $count -ge 2) { $FirstScaleOutUtc = $sampleTime }
+    if ($FirstScaleOutUtc -and $count -eq 0) {
+        $ZeroAfterScaleOutUtc = $sampleTime
+        break
+    }
+    Write-Host "$(Get-Date -Format HH:mm:ss) revision=$TestRevision replicas=$count peak=$PeakReplicas"
     Start-Sleep 5
 }
+[pscustomobject]@{
+    Revision=$TestRevision; Samples=$ReplicaSamples.Count; PeakReplicas=$PeakReplicas
+    FirstScaleOutUtc=$FirstScaleOutUtc; ZeroAfterScaleOutUtc=$ZeroAfterScaleOutUtc
+}
+if ($PeakReplicas -lt 2) { throw 'The selected revision did not demonstrate scale-out.' }
+if (-not $ZeroAfterScaleOutUtc) { throw 'The selected revision did not return to zero within the monitoring window.' }
 ```
 
 Do not deploy configuration changes while this test is running, because they can change which revision receives traffic.
@@ -1626,7 +1657,7 @@ Invoke-Native -File az -Arguments @('containerapp','replica','list','-g',$Resour
 Invoke-Native -File az -Arguments @('containerapp','logs','show','-g',$ResourceGroup,'-n',$ContainerAppName,'--type','system','--tail','100')
 ```
 
-Stop all endpoint tests and browser refreshes after load. Keep the replica monitor running: management-plane queries do not themselves send requests to the app. Allow several minutes for scale-in; if zero is not reached within the monitoring window, inspect active traffic, minimum replicas, rules, and logs rather than assuming failure or waiting indefinitely. Stop the monitor with Ctrl+C if finished early.
+Stop all endpoint tests and browser refreshes after load. Keep the replica monitor running: management-plane queries do not themselves send requests to the app. The monitor records actual platform replica counts and stops after it has seen at least two replicas and later zero. Scale-in timing varies; if zero is not reached within 15 minutes, inspect active traffic, minimum replicas, rules, and logs rather than assuming failure or waiting indefinitely. If the load test is interrupted, stop other endpoint traffic and allow the same autoscale rule to recover naturally.
 
 Once zero is observed, send one request and note cold-start latency:
 
@@ -1637,9 +1668,9 @@ Measure-Command { Invoke-RestMethod "$ContainerAppUrl/api/info" -TimeoutSec 90 |
 ### Acceptance criteria
 
 - [ ] The load script reports successful requests and no unexplained failures.
-- [ ] Platform monitoring shows the selected revision reaching at least two replicas during load.
+- [ ] Platform monitoring records a peak of at least two replicas for the selected revision during load.
 - [ ] Record the distinct machine values as corroborating evidence. Multiple replicas can exist even if a particular request sample does not reach each one.
-- [ ] After traffic stops, the revision scales in and eventually reaches zero.
+- [ ] After traffic stops, the monitor records the same revision reaching zero within the bounded window.
 - [ ] A subsequent request succeeds after cold start.
 
 If scale-out is absent, inspect effective scale JSON, active/ready revision, successful traffic, system logs, and available quota. Repeat the bounded test for up to 300 seconds if necessary; do not raise concurrency indefinitely. Scaling decisions in logs are diagnostic evidence, not a substitute for demonstrating actual additional replicas.

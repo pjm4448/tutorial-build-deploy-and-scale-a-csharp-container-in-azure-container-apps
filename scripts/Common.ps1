@@ -40,6 +40,16 @@ function Assert-LabSubscription {
     }
 }
 
+function Get-ReplicaCount {
+    param([Parameter(Mandatory)][string]$Revision)
+
+    $replicaJson = Invoke-Native -File az -Arguments @(
+        'containerapp', 'replica', 'list', '-g', $ResourceGroup, '-n', $ContainerAppName,
+        '--revision', $Revision, '--output', 'json'
+    )
+    @((($replicaJson | Out-String) | ConvertFrom-Json)).Count
+}
+
 function Wait-AppRevision {
     param(
         [Parameter(Mandatory)][string]$ExpectedRevision,
